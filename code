@@ -1,0 +1,793 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+#define RESET "\033[0m"
+#define GREEN "\033[42;30m"
+#define RED "\033[41;30m"
+
+#define MAX_NOM_FICHIER 20
+#define BLOCK_SIZE 256
+#define MAX_FIELDS 10
+#define MAX_BLOCS 10
+#define MAX_RECORDS 100
+
+// Structures et types de donn�es
+typedef struct Record {
+    int id;
+    char **fields;
+    int supprime; // champ pour suppression logique
+    struct Record *next;
+} Record;
+
+typedef struct {
+    int est_occupe;
+    char nom_fichier[MAX_NOM_FICHIER];
+    int nombre_enregistrements;
+    Record *enregistrements;
+} BlocMemoire;
+
+typedef struct {
+    BlocMemoire *blocs;
+    int nombre_blocs;
+} MemoireSecondaire;
+
+typedef struct {
+    char filename[MAX_NOM_FICHIER];
+    int totalBlocks;
+    int totalRecords;
+    int firstBlock;
+    int globalMode;
+    int internalMode;
+} Metadata;
+
+typedef struct {
+    Record records[MAX_RECORDS];
+    int recordCount;
+    Record *head;
+} DataFile;
+
+typedef struct {
+    DataFile dataFiles[MAX_BLOCS];
+    Metadata metadata[MAX_BLOCS];
+    int totalFiles;
+} FileSystem;
+
+// Fonctionnalit�s de base
+int lire_entier_securise(const char *invite) {
+    char buffer[100];
+    int valeur;
+    while (1) {
+        printf("%s", invite);
+        if (fgets(buffer, sizeof(buffer), stdin)) {
+            if (sscanf(buffer, "%d", &valeur) == 1) {
+                return valeur;
+            }
+        }
+        printf("Entr�e invalide. Veuillez entrer un entier.\n");
+    }
+}
+
+int lire_entier_choix(const char *invite, int min, int max) {
+    int valeur;
+    do {
+        valeur = lire_entier_securise(invite);
+        if (valeur < min || valeur > max) {
+            printf("Erreur : veuillez entrer une valeur entre %d et %d.\n", min, max);
+        }
+    } while (valeur < min || valeur > max);
+    return valeur;
+}
+
+void lire_chaine_securisee(const char *invite, char *chaine, int taille) {
+    printf("%s", invite);
+    if (fgets(chaine, taille, stdin)) {
+        char *pos = strchr(chaine, '\n');
+        if (pos) {
+            *pos = '\0';
+        }
+    }
+}
+
+MemoireSecondaire* initialiser_disque(int nombre_blocs) {
+    MemoireSecondaire *memoire = (MemoireSecondaire *)malloc(sizeof(MemoireSecondaire));
+    if (!memoire) {
+        printf("Erreur : m�moire insuffisante pour cr�er la m�moire secondaire.\n");
+        return NULL;
+    }
+
+    memoire->blocs = (BlocMemoire *)malloc(nombre_blocs * sizeof(BlocMemoire));
+    if (!memoire->blocs) {
+        printf("Erreur : m�moire insuffisante pour allouer les blocs.\n");
+        free(memoire);
+        return NULL;
+    }
+
+    memoire->nombre_blocs = nombre_blocs;
+    for (int i = 0; i < nombre_blocs; i++) {
+        memoire->blocs[i].est_occupe = 0;
+        strcpy(memoire->blocs[i].nom_fichier, "");
+        memoire->blocs[i].nombre_enregistrements = 0;
+        memoire->blocs[i].enregistrements = NULL;
+    }
+
+    return memoire;
+}
+
+int calculerBlocsLibres(MemoireSecondaire *memoire) {
+    int libres = 0;
+    for (int i = 0; i < memoire->nombre_blocs; i++) {
+        if (!memoire->blocs[i].est_occupe) {
+            libres++;
+        }
+    }
+    return libres;
+}
+
+void insererEnregistrementTrie(DataFile *file, Record *newRecord) {
+    if (!file->head || file->head->id > newRecord->id) {
+        newRecord->next = file->head;
+        file->head = newRecord;
+        return;
+    }
+
+    Record *current = file->head;
+    while (current->next && current->next->id < newRecord->id) {
+        current = current->next;
+    }
+    newRecord->next = current->next;
+    current->next = newRecord;
+}
+
+void compactMemory(MemoireSecondaire *memoire) {
+    int targetIndex = 0;
+    for (int i = 0; i < memoire->nombre_blocs; i++) {
+        if (memoire->blocs[i].est_occupe) {
+            if (i != targetIndex) {
+                memoire->blocs[targetIndex] = memoire->blocs[i];
+                memoire->blocs[i].est_occupe = 0;
+            }
+            targetIndex++;
+        }
+    }
+    printf("M�moire secondaire compact�e avec succ�s.\n");
+}
+
+void createDataFile(FileSystem *fs, MemoireSecondaire *memoire) {
+    if (fs->totalFiles >= MAX_BLOCS) {
+        printf("Erreur : Limite maximale de fichiers atteinte.\n");
+        return;
+    }
+
+    Metadata *meta = &fs->metadata[fs->totalFiles];
+    DataFile *file = &fs->dataFiles[fs->totalFiles];
+
+    // Demander les caract�ristiques du fichier
+    lire_chaine_securisee("Entrez le nom du fichier : ", meta->filename, MAX_NOM_FICHIER);
+    meta->totalRecords = lire_entier_securise("Entrez le nombre d'enregistrements : ");
+    meta->globalMode = lire_entier_choix("Entrez le mode global (1: contigu, 2: cha�n�) : ", 1, 2);
+    meta->internalMode = lire_entier_choix("Entrez le mode interne (1: tri�, 2: non tri�) : ", 1, 2);
+
+    // Calculer les blocs n�cessaires
+    meta->totalBlocks = (meta->totalRecords * sizeof(Record) + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    meta->firstBlock = -1;
+
+    // V�rification de l'espace disponible
+    int blocsLibres = calculerBlocsLibres(memoire);
+    if (blocsLibres < meta->totalBlocks) {
+        printf("Espace insuffisant pour cr�er le fichier. Tentative de compactage...\n");
+        compactMemory(memoire);
+        blocsLibres = calculerBlocsLibres(memoire);
+        if (blocsLibres < meta->totalBlocks) {
+            printf("Erreur : M�moire pleine. Impossible de cr�er le fichier.\n");
+            return;
+        }
+    }
+
+    // Initialisation automatique des enregistrements
+    for (int i = 0; i < meta->totalRecords; i++) {
+        Record *newRecord = (Record *)malloc(sizeof(Record));
+        if (!newRecord) {
+            printf("Erreur : m�moire insuffisante pour ajouter un enregistrement.\n");
+            return;
+        }
+
+        // Initialiser automatiquement l'ID et les champs
+        newRecord->id = i + 1; // Exemple : ID initialis� de mani�re s�quentielle
+        newRecord->fields =(char **) malloc(MAX_FIELDS * sizeof(char *));
+        for (int j = 0; j < MAX_FIELDS; j++) {
+            newRecord->fields[j] =(char*) malloc(50 * sizeof(char));
+            snprintf(newRecord->fields[j], 50, "Valeur par d�faut %d-%d", i + 1, j + 1);
+        }
+        newRecord->next = NULL;
+
+        // Insertion en fonction du mode interne
+        if (meta->internalMode == 1) { // Mode tri�
+            insererEnregistrementTrie(file, newRecord);
+        } else { // Mode non tri�
+            if (!file->head) {
+                file->head = newRecord;
+            } else {
+                Record *current = file->head;
+                while (current->next) {
+                    current = current->next;
+                }
+                current->next = newRecord;
+            }
+        }
+        
+        file->recordCount++;
+    }
+
+    // Mise � jour des m�tadonn�es
+    meta->firstBlock = -1; // Peut �tre mis � jour si des blocs sont affect�s ici.
+    meta->totalBlocks = (meta->totalRecords * sizeof(Record) + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        
+    fs->totalFiles++;
+    printf("Fichier cr�� et rempli automatiquement avec succ�s : %s\n", meta->filename);
+}
+
+void afficher_ids_enregistrements(DataFile *file) {
+    if (file->recordCount == 0) {
+        printf("Aucun enregistrement disponible.\n");
+        return;
+    }
+
+    printf("Liste des IDs disponibles : ");
+    if (file->head) { // Mode cha�n�
+        Record *current = file->head;
+        while (current) {
+            printf("%d ", current->id);
+            current = current->next;
+        }
+    } else { // Mode contigu
+        for (int i = 0; i < file->recordCount; i++) {
+            printf("%d ", file->records[i].id);
+        }
+    }
+    printf("\n");
+}
+
+void insertRecord(FileSystem *fs, MemoireSecondaire *memoire, const char *filename) {
+    for (int i = 0; i < fs->totalFiles; i++) {
+        if (strcmp(fs->metadata[i].filename, filename) == 0) {
+            DataFile *file = &fs->dataFiles[i];
+            Metadata *meta = &fs->metadata[i];
+
+            if (file->recordCount >= MAX_RECORDS) {
+                printf("Erreur : Limite maximale d'enregistrements atteinte.\n");
+                return;
+            }
+
+            int blocsLibres = calculerBlocsLibres(memoire);
+            if (blocsLibres < 1) { // Au moins un bloc libre est n�cessaire
+                printf("Espace insuffisant pour ins�rer un enregistrement. Tentative de compactage...\n");
+                compactMemory(memoire);
+                blocsLibres = calculerBlocsLibres(memoire);
+                if (blocsLibres < 1) {
+                    printf("Erreur : M�moire pleine. Impossible d'ins�rer l'enregistrement.\n");
+                    return;
+                }
+            }
+
+            // V�rification pour mode contigu
+            if (meta->globalMode == 1 && file->recordCount >= meta->totalBlocks * BLOCK_SIZE / sizeof(Record)) {
+                printf("Erreur : Pas assez d'espace pour ins�rer l'enregistrement dans le mode contigu.\n");
+                return;
+            }
+
+            // Proc�der � l'insertion de l'enregistrement
+            Record *newRecord = (Record *)malloc(sizeof(Record));
+            if (!newRecord) {
+                printf("Erreur : m�moire insuffisante pour ajouter un enregistrement.\n");
+                return;
+            }
+
+            newRecord->id = lire_entier_securise("Entrez l'ID de l'enregistrement : ");
+            newRecord->fields =(char**) malloc(MAX_FIELDS * sizeof(char *));
+            for (int j = 0; j < MAX_FIELDS; j++) {
+                newRecord->fields[j] =(char*) malloc(50 * sizeof(char*));
+                snprintf(newRecord->fields[j], 50, "Valeur par d�faut %d", j + 1);
+            }
+            newRecord->next = NULL;
+
+            // Insertion en fonction du mode interne
+            if (meta->internalMode == 1) { // Mode tri�
+                insererEnregistrementTrie(file, newRecord);
+            } else { // Mode non tri�
+                if (!file->head) {
+                    file->head = newRecord;
+                } else {
+                    Record *current = file->head;
+                    while (current->next) {
+                        current = current->next;
+                    }
+                    current->next = newRecord;
+                }
+            }
+
+            file->recordCount++;
+            // Mise � jour des m�tadonn�es apr�s insertion
+            meta->totalRecords = file->recordCount;
+            printf("Enregistrement ajout� avec succ�s.\n");
+            return;
+        }
+    }
+    printf("Erreur : Fichier %s non trouv�.\n", filename);
+}                       
+
+void searchRecord(FileSystem *fs, const char *filename, int id) {
+    for (int i = 0; i < fs->totalFiles; i++) {
+        if (strcmp(fs->metadata[i].filename, filename) == 0) {
+            DataFile *file = &fs->dataFiles[i];
+            Metadata *meta = &fs->metadata[i];
+            printf("Recherche de l'enregistrement avec l'ID %d dans le fichier %s...\n", id, filename);
+            
+            afficher_ids_enregistrements(file);
+
+            if (meta->globalMode == 1) { // Mode contigu
+                for (int j = 0; j < file->recordCount; j++) {
+                    if (file->records[j].id == id) {
+                        int bloc = j / (BLOCK_SIZE / sizeof(Record));
+                        int deplacement = j % (BLOCK_SIZE / sizeof(Record));
+                        printf("Enregistrement trouv� : Bloc = %d, D�placement = %d\n", bloc, deplacement);
+                        return;
+                    }
+                }
+            } else { // Mode cha�n�
+                Record *current = file->head;
+                int position = 0;
+                while (current) {
+                    if (current->id == id) {
+                        printf("Enregistrement trouv� : Position dans la liste cha�n�e = %d\n", position);
+                        return;
+                    }
+                    current = current->next;
+                    position++;
+                }
+            }
+
+            printf("Erreur : Enregistrement avec l'ID %d non trouv�.\n", id);
+            return;
+        }
+    }
+    printf("Erreur : Fichier %s non trouv�.\n", filename);
+}
+
+
+void deleteRecord(FileSystem *fs, const char *filename, int id) {
+    for (int i = 0; i < fs->totalFiles; i++) {
+        if (strcmp(fs->metadata[i].filename, filename) == 0) {
+            DataFile *file = &fs->dataFiles[i];
+            Metadata *meta = &fs->metadata[i];
+
+            printf("Suppression de l'enregistrement avec l'ID %d dans le fichier %s...\n", id, filename);
+             
+
+            if (meta->globalMode == 1) { // Mode contigu
+                int found = 0;
+                for (int j = 0; j < file->recordCount; j++) {
+                    if (file->records[j].id == id) {
+                        // Suppression logique
+                        file->records[j].supprime = 1;
+                        printf("Enregistrement avec l'ID %d marqu� comme supprim� (logique).\n", id);
+
+                        // Suppression physique
+                        for (int k = j; k < file->recordCount - 1; k++) {
+                            file->records[k] = file->records[k + 1];
+                        }
+                        file->recordCount--;
+                        printf("Enregistrement avec l'ID %d supprim� physiquement.\n", id);
+
+                        found = 1;
+                        break;
+                    }
+                }
+                if (!found) {
+                    printf("Erreur : Enregistrement avec l'ID %d non trouv�.\n", id);
+                }
+            } else { // Mode cha�n�
+                Record *current = file->head;
+                Record *prev = NULL;
+                while (current) {
+                    if (current->id == id) {
+                        // Suppression logique
+                        current->supprime = 1;
+                        printf("Enregistrement avec l'ID %d marqu� comme supprim� (logique).\n", id);
+
+                        // Suppression physique
+                        if (prev) {
+                            prev->next = current->next;
+                        } else {
+                            file->head = current->next;
+                        }
+                        free(current);
+                        file->recordCount--;
+                        // Mise � jour des m�tadonn�es
+                        meta->totalRecords = file->recordCount;
+
+                        printf("Enregistrement avec l'ID %d supprim� physiquement.\n", id);
+                        
+                        return;
+                    }
+                    prev = current;
+                    current = current->next;
+                }
+                printf("Erreur : Enregistrement avec l'ID %d non trouv�.\n", id);
+            }
+            return;
+        }
+    }
+    printf("Erreur : Fichier %s non trouv�.\n", filename);
+}
+
+void deleteDataFile(FileSystem *fs, MemoireSecondaire *memoire, const char *filename) {
+    for (int i = 0; i < fs->totalFiles; i++) {
+        if (strcmp(fs->metadata[i].filename, filename) == 0) {
+            DataFile *file = &fs->dataFiles[i];
+            Metadata *meta = &fs->metadata[i];
+
+            // Lib�ration des enregistrements en mode cha�n�
+            if (meta->globalMode == 2 && file->head) {
+                Record *current = file->head;
+                while (current) {
+                    Record *temp = current;
+                    current = current->next;
+                    free(temp);
+                }
+            }
+
+            // Lib�rer les blocs associ�s dans la m�moire secondaire
+            for (int j = 0; j < memoire->nombre_blocs; j++) {
+                if (memoire->blocs[j].est_occupe && strcmp(memoire->blocs[j].nom_fichier, filename) == 0) {
+                    memoire->blocs[j].est_occupe = 0;
+                    strcpy(memoire->blocs[j].nom_fichier, "");
+                    memoire->blocs[j].nombre_enregistrements = 0;
+                    memoire->blocs[j].enregistrements = NULL;
+                    
+                }
+            }
+
+            // R�initialisation des m�tadonn�es
+            memset(meta, 0, sizeof(Metadata));
+
+            // D�calage des fichiers restants
+            for (int j = i; j < fs->totalFiles - 1; j++) {
+                fs->metadata[j] = fs->metadata[j + 1];
+                fs->dataFiles[j] = fs->dataFiles[j + 1];
+            }
+
+            fs->totalFiles--;
+            printf("Fichier %s supprim� avec succ�s.\n", filename);
+            return;
+        }
+    }
+    printf("Erreur : Fichier %s non trouv�.\n", filename);
+}
+
+void demanderConfirmationEtSupprimer(FileSystem *fs, MemoireSecondaire *memoire, const char *filename) {
+    char confirmation[4];
+    while (1) {
+        printf("�tes-vous s�r de vouloir supprimer le fichier %s ? (oui/non) : ", filename);
+        lire_chaine_securisee("", confirmation, sizeof(confirmation));
+
+        if (strcmp(confirmation, "oui") == 0) {
+            deleteDataFile(fs, memoire, filename);
+            break;
+        } else if (strcmp(confirmation, "non") == 0) {
+            printf("Suppression annul�e.\n");
+            break;
+        } else {
+            printf("Entr�e invalide. Veuillez r�pondre par 'oui' ou 'non'.\n");
+        }
+    }
+}
+
+
+
+void renameDataFile(FileSystem *fs, const char *oldName, const char *newName) {
+    for (int i = 0; i < fs->totalFiles; i++) {
+        if (strcmp(fs->metadata[i].filename, oldName) == 0) {
+            strncpy(fs->metadata[i].filename, newName, MAX_NOM_FICHIER);
+            printf("Fichier renomm� de %s � %s avec succ�s.\n", oldName, newName);
+            return;
+        }
+    }
+    printf("Erreur : Fichier %s non trouv�.\n", oldName);
+}
+
+void afficherEtatMemoire(MemoireSecondaire *memoire) {
+    if (!memoire) {
+        printf("Erreur : m�moire secondaire non initialis�e.\n");
+        return;
+    }
+
+    printf("\n�tat de la m�moire secondaire :\n");
+    printf("\nChaque bloc peut �tre soit " GREEN "Libre" RESET " ou " RED "Occupe" RESET ".\n\n");
+
+    // Bord sup�rieur
+    printf("+------+------------------+----------------------+\n");
+    printf("| Bloc | �tat             | D�tails             |\n");
+    printf("+------+------------------+----------------------+\n");
+
+    // Parcourir et afficher les blocs
+    for (int i = 0; i < memoire->nombre_blocs; i++) {
+        BlocMemoire *bloc = &memoire->blocs[i];
+        if (bloc->est_occupe) {
+            // Affichage pour bloc occup� (rouge)
+            printf("| %-4d | %sUtilis�          %s | Nom : %-12s |\n", 
+                   i, RED, RESET, bloc->nom_fichier);
+            printf("|      |                  | Enregistrements : %-3d |\n", 
+                   bloc->nombre_enregistrements);
+        } else {
+            // Affichage pour bloc libre (vert)
+            printf("| %-4d | %sLibre            %s |                      |\n", 
+                   i, GREEN, RESET);
+        }
+        // S�parateur entre les lignes
+        printf("+------+------------------+----------------------+\n");
+    }
+    printf("\nR�sum� : %d blocs libres sur %d.\n",
+    calculerBlocsLibres(memoire), memoire->nombre_blocs);
+}
+
+
+
+void defragmentFile(FileSystem *fs, MemoireSecondaire *memoire, const char *filename) {
+    printf("D�but de la d�fragmentation du fichier %s...\n", filename);
+
+    // Rechercher le fichier dans le FileSystem
+    for (int i = 0; i < fs->totalFiles; i++) {
+        if (strcmp(fs->metadata[i].filename, filename) == 0) {
+            Metadata *meta = &fs->metadata[i];
+
+            printf("�tat avant d�fragmentation :\n");
+            afficherEtatMemoire(memoire);
+
+            int targetIndex = 0; // Position cible pour les blocs
+
+            // Parcourir les blocs pour r�organiser ceux du fichier sp�cifi�
+            for (int j = 0; j < memoire->nombre_blocs; j++) {
+                if (memoire->blocs[j].est_occupe && strcmp(memoire->blocs[j].nom_fichier, filename) == 0) {
+                    // Rechercher la prochaine position libre dans la m�moire
+                    while (targetIndex < memoire->nombre_blocs && memoire->blocs[targetIndex].est_occupe) {
+                        targetIndex++;
+                    }
+
+                    // Si une position libre est trouv�e et diff�rente du bloc actuel
+                    if (targetIndex < memoire->nombre_blocs && targetIndex != j) {
+                        // D�placer le bloc
+                        memoire->blocs[targetIndex] = memoire->blocs[j];
+                        memoire->blocs[j].est_occupe = 0;
+                        strcpy(memoire->blocs[j].nom_fichier, "");
+                        memoire->blocs[j].nombre_enregistrements = 0;
+                    }
+                }
+            }
+
+            // Mettre � jour le premier bloc des m�tadonn�es
+            meta->firstBlock = targetIndex - (meta->totalBlocks - 1);
+
+            printf("Fichier %s d�fragment� avec succ�s.\n", filename);
+            printf("�tat apr�s d�fragmentation :\n");
+            afficherEtatMemoire(memoire);
+            return;
+        }
+    }
+
+    printf("Erreur : Fichier %s non trouv�.\n", filename);
+}
+
+
+void loadFileIntoMemory(FileSystem *fs, MemoireSecondaire *memoire, const char *filename) {
+    for (int i = 0; i < fs->totalFiles; i++) {
+        if (strcmp(fs->metadata[i].filename, filename) == 0) {
+            Metadata *meta = &fs->metadata[i];
+            DataFile *file = &fs->dataFiles[i];
+
+            int blocksNeeded = meta->totalBlocks;
+
+            // V�rifier s'il y a suffisamment de blocs libres
+            int freeBlocks = 0;
+            for (int j = 0; j < memoire->nombre_blocs; j++) {
+                if (!memoire->blocs[j].est_occupe) {
+                    freeBlocks++;
+                }
+            }
+
+            if (freeBlocks < blocksNeeded) {
+                printf("Erreur : Pas assez de blocs libres pour charger le fichier %s.\n", filename);
+                return;
+            }
+
+            printf("Chargement du fichier %s en m�moire secondaire...\n", filename);
+
+            int blocksAllocated = 0;
+            for (int j = 0; j < memoire->nombre_blocs && blocksAllocated < blocksNeeded; j++) {
+                if (!memoire->blocs[j].est_occupe) {
+                    memoire->blocs[j].est_occupe = 1;
+                    strcpy(memoire->blocs[j].nom_fichier, filename);
+                    memoire->blocs[j].nombre_enregistrements = meta->totalRecords / blocksNeeded +
+                                                               (blocksAllocated < meta->totalRecords % blocksNeeded ? 1 : 0);
+                    memoire->blocs[j].enregistrements = NULL; // Ajoutez des enregistrements si n�cessaire
+                    printf("Bloc %d allou� pour le fichier %s.\n", j, filename); // Nouveau message
+                    blocksAllocated++;
+                }
+            }
+
+            printf("Fichier %s charg� avec succ�s.\n", filename);
+            return;
+        }
+    }
+    printf("Erreur : Fichier %s non trouv� dans le syst�me de fichiers.\n", filename);
+}
+
+
+void libererMemoire(MemoireSecondaire *memoire) {
+    if (memoire) {
+        free(memoire->blocs);
+        free(memoire);
+    }
+}
+
+
+void clearMemory(MemoireSecondaire *memoire) {
+    for (int i = 0; i < memoire->nombre_blocs; i++) {
+        memoire->blocs[i].est_occupe = 0;
+        strcpy(memoire->blocs[i].nom_fichier, "");
+        memoire->blocs[i].nombre_enregistrements = 0;
+        memoire->blocs[i].enregistrements = NULL;
+    }
+    printf("M�moire secondaire vid�e avec succ�s.\n");
+}
+
+
+void displayMetadata(FileSystem *fs) {
+    if (fs->totalFiles == 0) {
+        printf("Aucune m�tadonn�e disponible. Aucun fichier n'a �t� cr��.\n");
+        return;
+    }
+
+    printf("M�tadonn�es des fichiers :\n");
+    printf("+--------------------+--------+----------------+-------------+--------------+\n");
+    printf("| Nom du fichier     | Blocs  | Enregistrements| Mode global | Mode interne |\n");
+    printf("+--------------------+--------+----------------+-------------+--------------+\n");
+
+    for (int i = 0; i < fs->totalFiles; i++) {
+        Metadata *meta = &fs->metadata[i];
+
+        // D�terminer les descriptions textuelles des modes
+        const char *modeGlobal = (meta->globalMode == 1) ? "Contigu" : "Cha�n�";
+        const char *modeInterne = (meta->internalMode == 1) ? "Tri�" : "Non tri�";
+
+        printf("| %-18s | %-6d | %-14d | %-11s | %-12s |\n",
+               meta->filename,
+               meta->totalBlocks,
+               meta->totalRecords,
+               modeGlobal,
+               modeInterne);
+    }
+
+    printf("+--------------------+--------+----------------+-------------+--------------+\n");
+}
+
+
+int main() {
+    FileSystem fs = {0};
+    fs.totalFiles = 0;
+    
+    // Initialisation de la m�moire secondaire
+    MemoireSecondaire *memoire = initialiser_disque(MAX_BLOCS);
+    
+    if (!memoire) {
+        printf("Erreur : �chec de l'initialisation de la m�moire secondaire.\n");
+        return 1; // Quitter si la m�moire n'a pas �t� initialis�e correctement
+    }
+
+    int choix;
+    do {
+        printf("\nMenu Principal :\n");
+        printf("1. Cr�er un fichier\n");
+        printf("2. Charger un fichier\n");
+        printf("3. Supprimer un fichier\n");
+        printf("4. Renommer un fichier\n");
+        printf("5. Ins�rer un enregistrement\n");
+        printf("6. Supprimer un enregistrement\n");
+        printf("7. Rechercher un enregistrement\n");
+        printf("8. D�fragmenter un fichier\n");
+        printf("9. Afficher l'�tat de la m�moire\n");
+        printf("10. Compactage de la m�moire secondaire\n");
+        printf("11. Vider la m�moire secondaire\n");
+        printf("12. Afficher les m�tadonn�es des fichiers\n");
+        printf("13. Quitter\n");
+
+        choix = lire_entier_choix("Entrez votre choix : ", 1, 13);
+
+        char filename[MAX_NOM_FICHIER];
+        switch (choix) {
+            case 1:
+                createDataFile(&fs, memoire);
+                break;
+            case 2:
+                lire_chaine_securisee("Entrez le nom du fichier � charger : ", filename, MAX_NOM_FICHIER);
+                loadFileIntoMemory(&fs, memoire, filename);
+                break;
+
+            case 3:
+                lire_chaine_securisee("Entrez le nom du fichier � supprimer : ", filename, MAX_NOM_FICHIER);
+                demanderConfirmationEtSupprimer(&fs, memoire, filename);
+                break;
+
+            case 4: {
+                char newName[MAX_NOM_FICHIER]; // D�placement dans un bloc
+                lire_chaine_securisee("Entrez le nom actuel du fichier : ", filename, MAX_NOM_FICHIER);
+                lire_chaine_securisee("Entrez le nouveau nom du fichier : ", newName, MAX_NOM_FICHIER);
+                renameDataFile(&fs, filename, newName);
+                break;
+            }
+            case 5:
+                lire_chaine_securisee("Entrez le nom du fichier : ", filename, MAX_NOM_FICHIER);
+                insertRecord(&fs, memoire, filename);
+                break;
+            case 6: {
+                int id; 
+                lire_chaine_securisee("Entrez le nom du fichier : ", filename, MAX_NOM_FICHIER);
+                // Chercher le fichier et afficher les IDs disponibles
+                for (int i = 0; i < fs.totalFiles; i++) {
+                    if (strcmp(fs.metadata[i].filename, filename) == 0) {
+                        afficher_ids_enregistrements(&fs.dataFiles[i]);
+                        break;
+                    }
+                }
+                id = lire_entier_securise("Entrez l'ID de l'enregistrement � supprimer : ");
+                deleteRecord(&fs, filename, id);
+                break;
+            }
+            case 7:{
+            	int id;
+                lire_chaine_securisee("Entrez le nom du fichier : ", filename, MAX_NOM_FICHIER);
+                id = lire_entier_securise("Entrez l'ID de l'enregistrement � rechercher : ");
+                searchRecord(&fs, filename, id);
+				break;
+			}
+			
+            case 8: {
+                lire_chaine_securisee("Entrez le nom du fichier � d�fragmenter : ", filename, MAX_NOM_FICHIER);
+                defragmentFile(&fs,memoire, filename);
+                break;
+            }
+            
+            case 9:
+                afficherEtatMemoire(memoire);
+                break;
+			case 10:
+                compactMemory(memoire);
+                break;
+           case 11:
+                clearMemory(memoire);
+                break;
+           case 12:
+                displayMetadata(&fs);
+                break;	
+            case 13:
+                printf("Quitter le programme.\n");
+                break;
+        }
+    } while (choix != 13);
+    
+     // Lib�ration de la m�moire allou�e dynamiquement
+     
+    for (int i = 0; i < fs.totalFiles; i++) {
+    Record *current = fs.dataFiles[i].head;
+    while (current) {
+        Record *temp = current;
+        current = current->next;
+        free(temp);
+    }
+}
+libererMemoire(memoire);
+
+
+    return 0;
+}
