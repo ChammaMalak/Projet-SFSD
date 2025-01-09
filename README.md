@@ -1,9 +1,11 @@
 # Projet-SFSD
 
 -Introduction :
+
 .Ce simulateur est un programme permettant de gérer des fichiers et leur contenu en utilisant diverses opérations telles que la création, le chargement, la suppression, et bien d'autres. Le programme inclut également des fonctionnalités avancées comme la défragmentation, l'affichage de l'état de la mémoire et la gestion des métadonnées.
 
 -Navigation dans le Menu :
+
 .Lorsque le menu s'affiche, entrez le numéro correspondant à l'option désirée.
 .Suivez les invites pour entrer les informations nécessaires (par exemple, nom de fichier, ID d'enregistrement).
 .Pour quitter, choisissez l'option 13.
