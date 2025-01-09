@@ -90,12 +90,12 @@ Sélectionnez l'option 13 pour fermer le programme.
 
 -Gestion de la Mémoire :
 
-.La mémoire utilisée par les fichiers et enregistrements est allouée dynamiquement.
+La mémoire utilisée par les fichiers et enregistrements est allouée dynamiquement.
 
-.Le programme libère automatiquement la mémoire allouée avant de quitter.
+Le programme libère automatiquement la mémoire allouée avant de quitter.
 
 -Notes Importantes :
 
-.Respectez les limites de taille pour les noms de fichiers et autres entrées.
+Respectez les limites de taille pour les noms de fichiers et autres entrées.
 
-.Sauvegardez vos données avant de quitter pour éviter toute perte.
+Sauvegardez vos données avant de quitter pour éviter toute perte.
